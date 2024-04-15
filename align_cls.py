@@ -154,98 +154,12 @@ def main(_):
 
     pipeline.unet.to(accelerator.device,dtype=inference_dtype)
 
-
+    unet = pipeline.unet
     #********** classifier **********
-    classifier = models.resnet50(pretrained=True)
+    classifier = models.resnet18(pretrained=True)
     classifier.requires_grad_(True)
 
     classifier = classifier.to(accelerator.device,) #dtype=inference_dtype)
-
-
-    # Set correct lora layers
-    lora_attn_procs = {}
-    for name in pipeline.unet.attn_processors.keys():
-        cross_attention_dim = (
-            None if name.endswith("attn1.processor") else pipeline.unet.config.cross_attention_dim
-        )
-        if name.startswith("mid_block"):
-            hidden_size = pipeline.unet.config.block_out_channels[-1]
-        elif name.startswith("up_blocks"):
-            block_id = int(name[len("up_blocks.")])
-            hidden_size = list(reversed(pipeline.unet.config.block_out_channels))[block_id]
-        elif name.startswith("down_blocks"):
-            block_id = int(name[len("down_blocks.")])
-            hidden_size = pipeline.unet.config.block_out_channels[block_id]
-
-        lora_attn_procs[name] = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
-    pipeline.unet.set_attn_processor(lora_attn_procs)
-
-    # this is a hack to synchronize gradients properly. the module that registers the parameters we care about (in
-    # this case, AttnProcsLayers) needs to also be used for the forward pass. AttnProcsLayers doesn't have a
-    # `forward` method, so we wrap it to add one and capture the rest of the unet parameters using a closure.
-    class _Wrapper(AttnProcsLayers):
-        def forward(self, *args, **kwargs):
-            return pipeline.unet(*args, **kwargs)
-
-    unet = _Wrapper(pipeline.unet.attn_processors)        
-
-    # set up diffusers-friendly checkpoint saving with Accelerate
-
-    def save_model_hook(models, weights, output_dir):
-        output_splits = output_dir.split("/")
-        output_splits[1] = wandb.run.name
-        output_dir = "/".join(output_splits)
-        assert len(models) == 1
-        if isinstance(models[0], AttnProcsLayers):
-            pipeline.unet.save_attn_procs(output_dir)
-        else:
-            raise ValueError(f"Unknown model type {type(models[0])}")
-        weights.pop()  # ensures that accelerate doesn't try to handle saving of the model
-    
-
-    def load_model_hook(models, input_dir):
-        assert len(models) == 1
-        if config.soup_inference:
-            tmp_unet = UNet2DConditionModel.from_pretrained(
-                config.pretrained.model, revision=config.pretrained.revision, subfolder="unet"
-            )
-            tmp_unet.load_attn_procs(input_dir)
-            if config.resume_from_2 != "stablediffusion":
-                tmp_unet_2 = UNet2DConditionModel.from_pretrained(
-                    config.pretrained.model, revision=config.pretrained.revision, subfolder="unet"
-                )
-                tmp_unet_2.load_attn_procs(config.resume_from_2)
-                
-                attn_state_dict_2 = AttnProcsLayers(tmp_unet_2.attn_processors).state_dict()
-                
-            attn_state_dict = AttnProcsLayers(tmp_unet.attn_processors).state_dict()
-            if config.resume_from_2 == "stablediffusion":
-                for attn_state_key, attn_state_val in attn_state_dict.items():
-                    attn_state_dict[attn_state_key] = attn_state_val*config.mixing_coef_1
-            else:
-                for attn_state_key, attn_state_val in attn_state_dict.items():
-                    attn_state_dict[attn_state_key] = attn_state_val*config.mixing_coef_1 + attn_state_dict_2[attn_state_key]*(1.0 - config.mixing_coef_1)
-            
-            models[0].load_state_dict(attn_state_dict)
-                    
-            del tmp_unet                
-            
-            if config.resume_from_2 != "stablediffusion":
-                del tmp_unet_2
-                
-        elif isinstance(models[0], AttnProcsLayers):
-            tmp_unet = UNet2DConditionModel.from_pretrained(
-                config.pretrained.model, revision=config.pretrained.revision, subfolder="unet"
-            )
-            tmp_unet.load_attn_procs(input_dir)
-            models[0].load_state_dict(AttnProcsLayers(tmp_unet.attn_processors).state_dict())
-            del tmp_unet
-        else:
-            raise ValueError(f"Unknown model type {type(models[0])}")
-        models.pop()  # ensures that accelerate doesn't try to handle loading of the model
-
-    accelerator.register_save_state_pre_hook(save_model_hook)
-    accelerator.register_load_state_pre_hook(load_model_hook)    
 
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
@@ -254,14 +168,6 @@ def main(_):
     
     # Initialize the optimizer
     optimizer_cls = torch.optim.AdamW
-
-    optimizer = optimizer_cls(
-        unet.parameters(),
-        lr=config.train.learning_rate,
-        betas=(config.train.adam_beta1, config.train.adam_beta2),
-        weight_decay=config.train.adam_weight_decay,
-        eps=config.train.adam_epsilon,
-    )
 
     # ******** classifier ***********
     cls_optimizer = optimizer_cls(
@@ -294,9 +200,6 @@ def main(_):
 
     autocast = contextlib.nullcontext
     
-    # Prepare everything with our `accelerator`.
-    unet, optimizer = accelerator.prepare(unet, optimizer)
-
     #*********** classifier ************
     classifier, cls_optimizer = accelerator.prepare(classifier, cls_optimizer)
     transforms = torchvision.transforms.Compose([
@@ -309,7 +212,6 @@ def main(_):
 
     loss_fn = torch.nn.CrossEntropyLoss(reduction='none')
 
-    keep_input = True
     timesteps = pipeline.scheduler.timesteps
     
     if config.resume_from:
@@ -341,9 +243,6 @@ def main(_):
 
         #################### TRAINING ####################        
         for epoch in list(range(first_epoch, config.num_epochs)):
-            unet.train()
-            
-
 
             info = defaultdict(list)
             info_vis = defaultdict(list)
@@ -373,83 +272,71 @@ def main(_):
                 ).input_ids.to(accelerator.device)   
 
                 pipeline.scheduler.alphas_cumprod = pipeline.scheduler.alphas_cumprod.to(accelerator.device)
-                prompt_embeds = pipeline.text_encoder(prompt_ids)[0]         
-                
-            
-                with accelerator.accumulate(unet):
-                    with accelerator.accumulate(classifier):
-                        with autocast():
-                            with torch.enable_grad(): # important b/c don't have on by default in module                        
+                prompt_embeds = pipeline.text_encoder(prompt_ids)[0]   
 
-                                keep_input = True
-                                for i, t in tqdm(enumerate(timesteps), total=len(timesteps)):
-                                    t = torch.tensor([t],
-                                                        dtype=inference_dtype,
-                                                        device=latent.device)
-                                    t = t.repeat(config.train.batch_size_per_gpu_available)
-                                    
-                                    if config.grad_checkpoint:
-                                        noise_pred_uncond = checkpoint.checkpoint(unet, latent, t, train_neg_prompt_embeds, use_reentrant=False).sample
-                                        noise_pred_cond = checkpoint.checkpoint(unet, latent, t, prompt_embeds, use_reentrant=False).sample
-                                    else:
-                                        noise_pred_uncond = unet(latent, t, train_neg_prompt_embeds).sample
-                                        noise_pred_cond = unet(latent, t, prompt_embeds).sample
-                                                                    
-                                    if config.truncated_backprop:
-                                        if config.truncated_backprop_rand:
-                                            timestep = random.randint(config.truncated_backprop_minmax[0],config.truncated_backprop_minmax[1])
-                                            if i < timestep:
-                                                noise_pred_uncond = noise_pred_uncond.detach()
-                                                noise_pred_cond = noise_pred_cond.detach()
-                                        else:
-                                            if i < config.trunc_backprop_timestep:
-                                                noise_pred_uncond = noise_pred_uncond.detach()
-                                                noise_pred_cond = noise_pred_cond.detach()
-
-                                    grad = (noise_pred_cond - noise_pred_uncond)
-                                    noise_pred = noise_pred_uncond + config.sd_guidance_scale * grad                
-                                    latent = pipeline.scheduler.step(noise_pred, t[0].long(), latent).prev_sample
+                with torch.no_grad():
+                    for i, t in tqdm(enumerate(timesteps), total=len(timesteps)):
+                        t = torch.tensor([t],
+                                            dtype=inference_dtype,
+                                            device=latent.device)
+                        t = t.repeat(config.train.batch_size_per_gpu_available)
+                        
+                        if config.grad_checkpoint:
+                            noise_pred_uncond = checkpoint.checkpoint(unet, latent, t, train_neg_prompt_embeds, use_reentrant=False).sample
+                            noise_pred_cond = checkpoint.checkpoint(unet, latent, t, prompt_embeds, use_reentrant=False).sample
+                        else:
+                            noise_pred_uncond = unet(latent, t, train_neg_prompt_embeds).sample
+                            noise_pred_cond = unet(latent, t, prompt_embeds).sample
                                                         
-                                ims = pipeline.vae.decode(latent.to(pipeline.vae.dtype) / 0.18215).sample
-                                
-                                # ********classifier**************
-                                # ** Normalize???
-                                # ims = torch.clamp(ims, 0, 1)
-                                viz_ims = ims.clone().detach()
+                        if config.truncated_backprop:
+                            if config.truncated_backprop_rand:
+                                timestep = random.randint(config.truncated_backprop_minmax[0],config.truncated_backprop_minmax[1])
+                                if i < timestep:
+                                    noise_pred_uncond = noise_pred_uncond.detach()
+                                    noise_pred_cond = noise_pred_cond.detach()
+                            else:
+                                if i < config.trunc_backprop_timestep:
+                                    noise_pred_uncond = noise_pred_uncond.detach()
+                                    noise_pred_cond = noise_pred_cond.detach()
 
-                                ims = (ims/ 2 + 0.5).clamp(0, 1)
-                                ims = transforms(ims)
-                                logits = classifier(ims)
+                        grad = (noise_pred_cond - noise_pred_uncond)
+                        noise_pred = noise_pred_uncond + config.sd_guidance_scale * grad                
+                        latent = pipeline.scheduler.step(noise_pred, t[0].long(), latent).prev_sample
+                                            
+                    ims = pipeline.vae.decode(latent.to(pipeline.vae.dtype) / 0.18215).sample
+                            
+                with accelerator.accumulate(classifier):
+                    with autocast():
+                        with torch.enable_grad(): # important b/c don't have on by default in module                        
 
-                                loss = loss_fn(logits,labels)
-                                
-                                loss =  loss.sum()
-                                loss = loss/config.train.batch_size_per_gpu_available
-                                loss = loss * config.train.loss_coeff
+                            viz_ims = ims.clone().detach()
 
-                                accuracy = (torch.argmax(logits,dim=1) == labels).float()
-                                
-                                if len(info_vis["image"]) < config.max_vis_images:
-                                    info_vis["image"].append(viz_ims)
-                                    info_vis["prompts"] = list(info_vis["prompts"]) + list(prompts)
-                                    info_vis["acc"].append(accuracy.clone().detach())
-                                
-                                info["loss"].append(loss)
-                                info["accuracy"].append(accuracy.mean())
-                                
-                                # backward pass
-                                accelerator.backward(loss)
+                            ims = (ims/ 2 + 0.5).clamp(0, 1)
+                            ims = transforms(ims)
+                            logits = classifier(ims)
 
-                                #*******negate the parametrs**********
-                                [p.grad.data.neg_() for p in unet.parameters()]
-                                if accelerator.sync_gradients:
-                                    accelerator.clip_grad_norm_(unet.parameters(), config.train.max_grad_norm)
-                                # optimizer.step()
-                                # optimizer.zero_grad() 
+                            loss = loss_fn(logits,labels)
+                            
+                            loss =  loss.sum()
+                            loss = loss/config.train.batch_size_per_gpu_available
+                            loss = loss * config.train.loss_coeff
 
-                                #*******classifier**********
-                                cls_optimizer.step()
-                                cls_optimizer.zero_grad()
+                            accuracy = (torch.argmax(logits,dim=1) == labels).float()
+                            
+                            if len(info_vis["image"]) < config.max_vis_images:
+                                info_vis["image"].append(viz_ims)
+                                info_vis["prompts"] = list(info_vis["prompts"]) + list(prompts)
+                                info_vis["acc"].append(accuracy.clone().detach())
+                            
+                            info["loss"].append(loss)
+                            info["accuracy"].append(accuracy.mean())
+                            
+                            # backward pass
+                            accelerator.backward(loss)
+
+                            #*******classifier**********
+                            cls_optimizer.step()
+                            cls_optimizer.zero_grad()
                      
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
@@ -511,12 +398,12 @@ def main(_):
             # make sure we did an optimization step at the end of the inner epoch
             assert accelerator.sync_gradients
             
-            if epoch % config.save_freq == 0 and accelerator.is_main_process:
-                accelerator.save_state()
-                output_splits = output_dir.split("/")
-                output_splits[1] = wandb.run.name
-                output_dir = "/".join(output_splits)
-                accelerator.save_model(classifier, output_dir)
+            # if epoch % config.save_freq == 0 and accelerator.is_main_process:
+            #     # accelerator.save_state()
+            #     output_splits = output_dir.split("/")
+            #     output_splits[1] = wandb.run.name
+            #     output_dir = "/".join(output_splits)
+            #     # accelerator.save_model(classifier, output_dir)
 
 
 if __name__ == "__main__":

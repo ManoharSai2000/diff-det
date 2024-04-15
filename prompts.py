@@ -3,10 +3,32 @@ import os
 import functools
 import random
 import inflect
+from dataset import ImageNette
+
+dataset = ImageNette()
 
 IE = inflect.engine()
 ASSETS_PATH = resources.files("assets")
 
+classes = {"tench" : "n01440764", 
+           "English springer" : "n02102040",
+           "cassette player" : "n02979186", 
+           "chain saw" : "n03000684", 
+           "church" : "n03028079", 
+           "French horn" : "n03394916", 
+           "garbage truck" : "n03417042", 
+           "gas pump" : "n03425413", 
+           "golf ball" : "n03445777", 
+           "parachute" : "n03888257"
+}
+class_names = list(classes.keys()) 
+
+def get_prompt(cls):
+    return f"an image of {cls}"
+
+def class_prompts():
+    cls = random.choice(list(range(len(class_names))))
+    return get_prompt(class_names[cls]), dataset.idx2label[classes[class_names[cls]]]
 
 @functools.cache
 def _load_lines(path):

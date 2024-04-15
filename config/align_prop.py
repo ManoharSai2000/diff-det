@@ -12,14 +12,14 @@ def general():
     config.save_freq = 4
     config.resume_from = ""
     config.resume_from_2 = ""
-    config.vis_freq = 1
+    config.vis_freq = 8
     config.max_vis_images = 2
     config.only_eval = False
     config.run_name = ""
     
     # prompting
-    config.prompt_fn = "simple_animals"
-    config.reward_fn = "aesthetic"
+    config.prompt_fn = "class_prompts"
+    config.reward_fn = "classifier_loss"
     config.debug =False
     # mixed precision training. options are "fp16", "bf16", and "no". half-precision speeds up training significantly.
     config.mixed_precision  = "fp16"
@@ -38,7 +38,7 @@ def general():
     # allow tf32 on Ampere GPUs, which can speed up training.
     config.allow_tf32 = True
 
-    config.visualize_train = False
+    config.visualize_train = True
     config.visualize_eval = True
 
     config.truncated_backprop = False
@@ -78,6 +78,12 @@ def general():
     pretrained.model = "runwayml/stable-diffusion-v1-5"
     # revision of the model to load.
     pretrained.revision = "main"
+
+    ##### Classifier ######
+    config.pretrained_classifier = "resnet50"
+    config.num_classes = 10
+    config.train.cls_learning_rate = 5e-4
+
     return config
 
 
@@ -100,6 +106,27 @@ def set_config_batch(config,total_samples_per_epoch, total_batch_size, per_gpu_c
     
     assert config.train.samples_per_epoch_per_gpu%config.train.batch_size_per_gpu_available==0, "samples_per_epoch_per_gpu must be divisible by batch_size_per_gpu_available"
     config.train.data_loader_iterations  = config.train.samples_per_epoch_per_gpu//config.train.batch_size_per_gpu_available    
+    return config
+
+
+def classifier():
+    config = general()
+    config.num_epochs = 200
+
+    config.train.max_grad_norm = 5.0    
+    config.train.loss_coeff = 0.01
+    config.train.learning_rate = 1e-3
+    config.max_vis_images = 4
+    config.train.adam_weight_decay = 0.1
+    
+    config.save_freq = 1
+    config.num_epochs = 10
+    config.num_checkpoint_limit = 14
+    config.truncated_backprop_rand = True
+    config.truncated_backprop_minmax = (0,50)
+    config.trunc_backprop_timestep = 40
+    config.truncated_backprop = True
+    config = set_config_batch(config,total_samples_per_epoch=256,total_batch_size= 16, per_gpu_capacity=2)
     return config
 
 def aesthetic():

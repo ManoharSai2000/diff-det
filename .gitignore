@@ -1,4 +1,5 @@
 wandb/
 logs/
+data/
 .vscode
 *.pyc
