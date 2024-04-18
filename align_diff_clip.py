@@ -30,6 +30,11 @@ from ml_collections import config_flags
 
 from torchvision.transforms import v2
 
+from transformers import CLIPProcessor, CLIPModel
+
+
+
+
 
 from dataset import ImageNette
 FLAGS = flags.FLAGS
@@ -120,7 +125,7 @@ def main(_):
     # freeze parameters of models to save more memory
     pipeline.vae.requires_grad_(False)
     pipeline.text_encoder.requires_grad_(False)
-    pipeline.unet.requires_grad_(False)
+    pipeline.unet.requires_grad_(True)
 
     
     # disable safety checker
@@ -156,10 +161,43 @@ def main(_):
 
     unet = pipeline.unet
     #********** classifier **********
-    classifier = models.resnet18(pretrained=True)
-    classifier.requires_grad_(True)
+    processor = CLIPProcessor.from_pretrained(model_id)
+    model = CLIPModel.from_pretrained(model_id)
+    
+    processor.requires_grad_(False)
+    model.requires_grad_(False)
+
+    model = CLIPModel.from_pretrained(model_id)
+    
 
     classifier = classifier.to(accelerator.device,) #dtype=inference_dtype)
+
+
+    lora_attn_procs = {}
+    for name in pipeline.unet.attn_processors.keys():
+        cross_attention_dim = (
+            None if name.endswith("attn1.processor") else pipeline.unet.config.cross_attention_dim
+        )
+        if name.startswith("mid_block"):
+            hidden_size = pipeline.unet.config.block_out_channels[-1]
+        elif name.startswith("up_blocks"):
+            block_id = int(name[len("up_blocks.")])
+            hidden_size = list(reversed(pipeline.unet.config.block_out_channels))[block_id]
+        elif name.startswith("down_blocks"):
+            block_id = int(name[len("down_blocks.")])
+            hidden_size = pipeline.unet.config.block_out_channels[block_id]
+
+        lora_attn_procs[name] = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
+    pipeline.unet.set_attn_processor(lora_attn_procs)
+
+    # this is a hack to synchronize gradients properly. the module that registers the parameters we care about (in
+    # this case, AttnProcsLayers) needs to also be used for the forward pass. AttnProcsLayers doesn't have a
+    # `forward` method, so we wrap it to add one and capture the rest of the unet parameters using a closure.
+    class _Wrapper(AttnProcsLayers):
+        def forward(self, *args, **kwargs):
+            return pipeline.unet(*args, **kwargs)
+
+    unet = _Wrapper(pipeline.unet.attn_processors)    
 
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
@@ -169,21 +207,24 @@ def main(_):
     # Initialize the optimizer
     optimizer_cls = torch.optim.AdamW
 
-    # ******** classifier ***********
-    cls_optimizer = optimizer_cls(
-        classifier.parameters(),
-        lr=config.train.cls_learning_rate,
+    optimizer = optimizer_cls(
+        unet.parameters(),
+        lr=config.train.learning_rate,
         betas=(config.train.adam_beta1, config.train.adam_beta2),
         weight_decay=config.train.adam_weight_decay,
         eps=config.train.adam_epsilon,
     )
 
-    prompt_fn = getattr(prompts_file, config.prompt_fn)
+    # # ******** classifier ***********
+    # cls_optimizer = optimizer_cls(
+    #     classifier.parameters(),
+    #     lr=config.train.cls_learning_rate,
+    #     betas=(config.train.adam_beta1, config.train.adam_beta2),
+    #     weight_decay=config.train.adam_weight_decay,
+    #     eps=config.train.adam_epsilon,
+    # )
 
-    if config.eval_prompt_fn == '':
-        eval_prompt_fn = prompt_fn
-    else:
-        eval_prompt_fn = getattr(prompts_file, config.eval_prompt_fn)
+    prompt_fn = getattr(prompts_file, config.prompt_fn)
 
     # generate negative prompt embeddings
     neg_prompt_embed = pipeline.text_encoder(
@@ -200,15 +241,15 @@ def main(_):
 
     autocast = contextlib.nullcontext
     
-    #*********** classifier ************
-    classifier, cls_optimizer = accelerator.prepare(classifier, cls_optimizer)
+    unet, optimizer = accelerator.prepare(unet, optimizer)
+    classifier = accelerator.prepare(classifier)
+    
     transforms = torchvision.transforms.Compose([
             v2.Resize((224,224)),
             v2.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ]
     )
     
-
 
     loss_fn = torch.nn.CrossEntropyLoss(reduction='none')
 
@@ -232,16 +273,16 @@ def main(_):
         
         classifier.eval()
         eval_loss,eval_acc = evaluate(classifier,eval_dataloader,accelerator)
-    print("Evaluation results", eval_acc)
-    if accelerator.is_main_process:
-        if config.run_name != "":
-            name_val = config.run_name
-        else:
-            name_val = wandb.run.name            
-        log_dir = f"logs/{name_val}/eval_vis"
-        os.makedirs(log_dir, exist_ok=True)                    
-        accelerator.log({"eval_loss": eval_loss,"eval_acc":eval_acc},step=global_step)        
-        accelerator.log({"epoch": 0, "inner_epoch": 0,"eval_accuracy":eval_acc,"eval_loss":eval_loss}, step=0)
+        print("Evaluation results", eval_acc)
+        if accelerator.is_main_process:
+            if config.run_name != "":
+                name_val = config.run_name
+            else:
+                name_val = wandb.run.name            
+            log_dir = f"logs/{name_val}/eval_vis"
+            os.makedirs(log_dir, exist_ok=True)                    
+            accelerator.log({"eval_loss": eval_loss,"eval_acc":eval_acc},step=global_step)        
+            accelerator.log({"epoch": 0, "inner_epoch": 0,"eval_accuracy":eval_acc,"eval_loss":eval_loss}, step=0)
 
 
     #################### TRAINING ####################        
@@ -252,7 +293,7 @@ def main(_):
         image_vis_list = []
         
         for inner_iters in tqdm(list(range(config.train.data_loader_iterations)),position=0,disable=not accelerator.is_local_main_process):
-            classifier.train()
+            unet.train()
             latent = torch.randn((config.train.batch_size_per_gpu_available, 4, 64, 64), device=accelerator.device, dtype=inference_dtype)    
 
             if accelerator.is_main_process:
@@ -267,7 +308,7 @@ def main(_):
             labels = labels.to(accelerator.device, dtype=torch.long)
 
             prompt_ids = pipeline.tokenizer(
-                prompts,
+                prompts,    
                 return_tensors="pt",
                 padding="max_length",
                 truncation=True,
@@ -277,40 +318,40 @@ def main(_):
             pipeline.scheduler.alphas_cumprod = pipeline.scheduler.alphas_cumprod.to(accelerator.device)
             prompt_embeds = pipeline.text_encoder(prompt_ids)[0]   
 
-            with torch.no_grad():
-                for i, t in tqdm(enumerate(timesteps), total=len(timesteps)):
-                    t = torch.tensor([t],
-                                        dtype=inference_dtype,
-                                        device=latent.device)
-                    t = t.repeat(config.train.batch_size_per_gpu_available)
-                    
-                    if config.grad_checkpoint:
-                        noise_pred_uncond = checkpoint.checkpoint(unet, latent, t, train_neg_prompt_embeds, use_reentrant=False).sample
-                        noise_pred_cond = checkpoint.checkpoint(unet, latent, t, prompt_embeds, use_reentrant=False).sample
-                    else:
-                        noise_pred_uncond = unet(latent, t, train_neg_prompt_embeds).sample
-                        noise_pred_cond = unet(latent, t, prompt_embeds).sample
-                                                    
-                    if config.truncated_backprop:
-                        if config.truncated_backprop_rand:
-                            timestep = random.randint(config.truncated_backprop_minmax[0],config.truncated_backprop_minmax[1])
-                            if i < timestep:
-                                noise_pred_uncond = noise_pred_uncond.detach()
-                                noise_pred_cond = noise_pred_cond.detach()
-                        else:
-                            if i < config.trunc_backprop_timestep:
-                                noise_pred_uncond = noise_pred_uncond.detach()
-                                noise_pred_cond = noise_pred_cond.detach()
-
-                    grad = (noise_pred_cond - noise_pred_uncond)
-                    noise_pred = noise_pred_uncond + config.sd_guidance_scale * grad                
-                    latent = pipeline.scheduler.step(noise_pred, t[0].long(), latent).prev_sample
-                                        
-                ims = pipeline.vae.decode(latent.to(pipeline.vae.dtype) / 0.18215).sample
-                        
-            with accelerator.accumulate(classifier):
+            with accelerator.accumulate(unet):
                 with autocast():
                     with torch.enable_grad(): # important b/c don't have on by default in module                        
+                        for i, t in tqdm(enumerate(timesteps), total=len(timesteps)):
+                            t = torch.tensor([t],
+                                                dtype=inference_dtype,
+                                                device=latent.device)
+                            t = t.repeat(config.train.batch_size_per_gpu_available)
+                            
+                            if config.grad_checkpoint:
+                                noise_pred_uncond = checkpoint.checkpoint(unet, latent, t, train_neg_prompt_embeds, use_reentrant=False).sample
+                                noise_pred_cond = checkpoint.checkpoint(unet, latent, t, prompt_embeds, use_reentrant=False).sample
+                            else:
+                                noise_pred_uncond = unet(latent, t, train_neg_prompt_embeds).sample
+                                noise_pred_cond = unet(latent, t, prompt_embeds).sample
+                                                            
+                            if config.truncated_backprop:
+                                if config.truncated_backprop_rand:
+                                    timestep = random.randint(config.truncated_backprop_minmax[0],config.truncated_backprop_minmax[1])
+                                    if i < timestep:
+                                        noise_pred_uncond = noise_pred_uncond.detach()
+                                        noise_pred_cond = noise_pred_cond.detach()
+                                else:
+                                    if i < config.trunc_backprop_timestep:
+                                        noise_pred_uncond = noise_pred_uncond.detach()
+                                        noise_pred_cond = noise_pred_cond.detach()
+
+                            grad = (noise_pred_cond - noise_pred_uncond)
+                            noise_pred = noise_pred_uncond + config.sd_guidance_scale * grad                
+                            latent = pipeline.scheduler.step(noise_pred, t[0].long(), latent).prev_sample
+                                                
+                        ims = pipeline.vae.decode(latent.to(pipeline.vae.dtype) / 0.18215).sample
+                                
+        
 
                         viz_ims = ims.clone().detach()
 
@@ -320,7 +361,7 @@ def main(_):
 
                         loss = loss_fn(logits,labels)
                         
-                        loss =  loss.sum()
+                        loss =  -loss.sum()
                         loss = loss/config.train.batch_size_per_gpu_available
                         loss = loss * config.train.loss_coeff
 
@@ -337,13 +378,18 @@ def main(_):
                         # backward pass
                         accelerator.backward(loss)
 
-                        #*******classifier**********
-                        cls_optimizer.step()
-                        cls_optimizer.zero_grad()
+                        #[p.grad.data.neg_() for p in unet.parameters()]
+                        if accelerator.sync_gradients:
+                            accelerator.clip_grad_norm_(unet.parameters(), config.train.max_grad_norm)
+                        optimizer.step()
+                        optimizer.zero_grad()
+
                     
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
+
+                logger.info(f"the inner steps is {inner_iters}")
                 assert (
                     inner_iters + 1
                 ) % config.train.gradient_accumulation_steps == 0

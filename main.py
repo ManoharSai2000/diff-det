@@ -343,8 +343,6 @@ def main(_):
         for epoch in list(range(first_epoch, config.num_epochs)):
             unet.train()
             
-
-
             info = defaultdict(list)
             info_vis = defaultdict(list)
             image_vis_list = []
@@ -444,8 +442,8 @@ def main(_):
                                 [p.grad.data.neg_() for p in unet.parameters()]
                                 if accelerator.sync_gradients:
                                     accelerator.clip_grad_norm_(unet.parameters(), config.train.max_grad_norm)
-                                # optimizer.step()
-                                # optimizer.zero_grad() 
+                                optimizer.step()
+                                optimizer.zero_grad() 
 
                                 #*******classifier**********
                                 cls_optimizer.step()

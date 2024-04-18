@@ -12,7 +12,7 @@ def general():
     config.save_freq = 4
     config.resume_from = ""
     config.resume_from_2 = ""
-    config.vis_freq = 8
+    config.vis_freq = 2
     config.max_vis_images = 2
     config.only_eval = False
     config.run_name = ""
@@ -82,7 +82,7 @@ def general():
     ##### Classifier ######
     config.pretrained_classifier = "resnet50"
     config.num_classes = 10
-    config.train.cls_learning_rate = 5e-4
+    config.train.cls_learning_rate = 1e-4
 
     return config
 
@@ -126,7 +126,7 @@ def classifier():
     config.truncated_backprop_minmax = (0,50)
     config.trunc_backprop_timestep = 40
     config.truncated_backprop = True
-    config = set_config_batch(config,total_samples_per_epoch=256,total_batch_size= 16, per_gpu_capacity=2)
+    config = set_config_batch(config,total_samples_per_epoch=256,total_batch_size= 4, per_gpu_capacity=2)
     return config
 
 def aesthetic():
