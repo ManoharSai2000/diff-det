@@ -26,6 +26,13 @@ class_names = list(classes.keys())
 def get_prompt(cls):
     return f"an image of {cls}"
 
+def get_eval_prompts():
+    eval_prompts, eval_labels = [], [] 
+    for cls in range(len(classes)):
+        eval_prompts.append(get_prompt(class_names[cls])), eval_labels.append(dataset.idx2label[classes[class_names[cls]]])
+    return eval_prompts,eval_labels
+
+
 def class_prompts():
     cls = random.choice(list(range(len(class_names))))
     return get_prompt(class_names[cls]), dataset.idx2label[classes[class_names[cls]]]

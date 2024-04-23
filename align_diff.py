@@ -354,14 +354,14 @@ def main(_):
                             accelerator.backward(loss)
                             no_params = 0
                             for param in unet.parameters():
-                                if param.requires_grad and torch.sum(param.grad)>0:
-                                    no_params+=1
+                                print(param[:3])
+                                break
 
                             print("\nUpdating pamateres : ", no_params)
                             #*******negate the parametrs**********
                             #[p.grad.data.neg_() for p in unet.parameters()]
-                            if accelerator.sync_gradients:
-                                accelerator.clip_grad_norm_(unet.parameters(), config.train.max_grad_norm)
+                            # if accelerator.sync_gradients:
+                            #     accelerator.clip_grad_norm_(unet.parameters(), config.train.max_grad_norm)
                             optimizer.step()
                             optimizer.zero_grad()                      
 

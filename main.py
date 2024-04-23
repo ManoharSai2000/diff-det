@@ -14,7 +14,6 @@ import torch.utils.checkpoint as checkpoint
 import wandb
 import contextlib
 import torchvision
-from torchvision import models
 from transformers import AutoProcessor, AutoModel
 import sys
 from diffusers.models.attention_processor import LoRAAttnProcessor
@@ -23,23 +22,53 @@ from diffusers import StableDiffusionPipeline, DDIMScheduler, UNet2DConditionMod
 import datetime
 import hpsv2
 from hpsv2.src.open_clip import create_model_and_transforms, get_tokenizer
-from accelerate.logging import get_logger    
+from accelerate.logging import get_logger 
+from torchvision import models   
 from accelerate import Accelerator
 from absl import app, flags
 from ml_collections import config_flags
-
-from torchvision.transforms import v2
-
-
-from dataset import ImageNette
 FLAGS = flags.FLAGS
 config_flags.DEFINE_config_file("config", "config/align_prop.py", "Training configuration.")
 from accelerate.utils import set_seed, ProjectConfiguration
 logger = get_logger(__name__)
+import torch.nn.functional as F
+from dataset import ImageNette
+from prompts import get_eval_prompts
+
+def cls_loss_fn(accelerator,config):
+    
+    normalize = torchvision.transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                                                std=[0.26862954, 0.26130258, 0.27577711])
+    
+    classifier = models.resnet18(pretrained=True)
+    classifier.requires_grad_(True)
+    classifier = classifier.to(accelerator.device)
+    cls_optimizer = torch.optim.AdamW(
+        classifier.parameters(),
+        lr=config.train.cls_learning_rate,
+        betas=(config.train.adam_beta1, config.train.adam_beta2),
+        weight_decay=config.train.adam_weight_decay,
+        eps=config.train.adam_epsilon,
+    )
+    classifier,cls_optimizer = accelerator.prepare(classifier,cls_optimizer)
 
 
+    target_size = 224
+    def loss_fn(ims,labels):
+        im_pix = ((ims / 2) + 0.5).clamp(0, 1) 
+        im_pix = torchvision.transforms.Resize(target_size)(im_pix)
+        im_pix = normalize(im_pix).to(ims.dtype)
+        
+        logits = classifier(im_pix)
+
+        loss = F.cross_entropy(logits, labels, reduction='none')
+        accuracy = (torch.argmax(logits,dim=1) == labels).float().detach()
+        return loss,accuracy
+        
+    return loss_fn,classifier,cls_optimizer
 
 def evaluate(classifier,dataloader,accelerate):
+    classifier.eval()
     eval_loss, eval_acc = [], 0
     num_samples = 0
     print("------Evaluating---------")
@@ -56,8 +85,36 @@ def evaluate(classifier,dataloader,accelerate):
     
     return np.mean(eval_loss),eval_acc/num_samples
 
+def evaluate_diff(latent,train_neg_prompt_embeds,prompts, pipeline, accelerator, inference_dtype, config, loss_fn,eval_labels):
+    print(prompts)
+    prompt_ids = pipeline.tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding="max_length",
+        truncation=True,
+        max_length=pipeline.tokenizer.model_max_length,
+    ).input_ids.to(accelerator.device)    
+
+    pipeline.scheduler.alphas_cumprod = pipeline.scheduler.alphas_cumprod.to(accelerator.device)
+    prompt_embeds = pipeline.text_encoder(prompt_ids)[0]         
     
-    
+    all_rgbs_t = []
+    for i, t in tqdm(enumerate(pipeline.scheduler.timesteps), total=len(pipeline.scheduler.timesteps)):
+        t = torch.tensor([t],
+                            dtype=inference_dtype,
+                            device=latent.device)
+        t = t.repeat(config.train.batch_size_per_gpu_available)
+
+        noise_pred_uncond = pipeline.unet(latent, t, train_neg_prompt_embeds).sample
+        noise_pred_cond = pipeline.unet(latent, t, prompt_embeds).sample
+                
+        grad = (noise_pred_cond - noise_pred_uncond)
+        noise_pred = noise_pred_uncond + config.sd_guidance_scale * grad
+        latent = pipeline.scheduler.step(noise_pred, t[0].long(), latent).prev_sample
+    ims = pipeline.vae.decode(latent.to(pipeline.vae.dtype) / 0.18215).sample
+    loss, rewards = loss_fn(ims,eval_labels)
+
+    return ims, rewards
 
 def main(_):
     config = FLAGS.config
@@ -122,7 +179,7 @@ def main(_):
     pipeline.text_encoder.requires_grad_(False)
     pipeline.unet.requires_grad_(False)
 
-    
+
     # disable safety checker
     pipeline.safety_checker = None    
     
@@ -149,19 +206,10 @@ def main(_):
         inference_dtype = torch.bfloat16    
 
     # Move unet, vae and text_encoder to device and cast to inference_dtype
-    pipeline.vae.to(accelerator.device,dtype=inference_dtype)
-    pipeline.text_encoder.to(accelerator.device,dtype=inference_dtype)
+    pipeline.vae.to(accelerator.device, dtype=inference_dtype)
+    pipeline.text_encoder.to(accelerator.device, dtype=inference_dtype)
 
-    pipeline.unet.to(accelerator.device,dtype=inference_dtype)
-
-
-    #********** classifier **********
-    classifier = models.resnet50(pretrained=True)
-    classifier.requires_grad_(True)
-
-    classifier = classifier.to(accelerator.device,) #dtype=inference_dtype)
-
-
+    pipeline.unet.to(accelerator.device, dtype=inference_dtype)    
     # Set correct lora layers
     lora_attn_procs = {}
     for name in pipeline.unet.attn_processors.keys():
@@ -189,64 +237,6 @@ def main(_):
 
     unet = _Wrapper(pipeline.unet.attn_processors)        
 
-    # set up diffusers-friendly checkpoint saving with Accelerate
-
-    def save_model_hook(models, weights, output_dir):
-        output_splits = output_dir.split("/")
-        output_splits[1] = wandb.run.name
-        output_dir = "/".join(output_splits)
-        assert len(models) == 1
-        if isinstance(models[0], AttnProcsLayers):
-            pipeline.unet.save_attn_procs(output_dir)
-        else:
-            raise ValueError(f"Unknown model type {type(models[0])}")
-        weights.pop()  # ensures that accelerate doesn't try to handle saving of the model
-    
-
-    def load_model_hook(models, input_dir):
-        assert len(models) == 1
-        if config.soup_inference:
-            tmp_unet = UNet2DConditionModel.from_pretrained(
-                config.pretrained.model, revision=config.pretrained.revision, subfolder="unet"
-            )
-            tmp_unet.load_attn_procs(input_dir)
-            if config.resume_from_2 != "stablediffusion":
-                tmp_unet_2 = UNet2DConditionModel.from_pretrained(
-                    config.pretrained.model, revision=config.pretrained.revision, subfolder="unet"
-                )
-                tmp_unet_2.load_attn_procs(config.resume_from_2)
-                
-                attn_state_dict_2 = AttnProcsLayers(tmp_unet_2.attn_processors).state_dict()
-                
-            attn_state_dict = AttnProcsLayers(tmp_unet.attn_processors).state_dict()
-            if config.resume_from_2 == "stablediffusion":
-                for attn_state_key, attn_state_val in attn_state_dict.items():
-                    attn_state_dict[attn_state_key] = attn_state_val*config.mixing_coef_1
-            else:
-                for attn_state_key, attn_state_val in attn_state_dict.items():
-                    attn_state_dict[attn_state_key] = attn_state_val*config.mixing_coef_1 + attn_state_dict_2[attn_state_key]*(1.0 - config.mixing_coef_1)
-            
-            models[0].load_state_dict(attn_state_dict)
-                    
-            del tmp_unet                
-            
-            if config.resume_from_2 != "stablediffusion":
-                del tmp_unet_2
-                
-        elif isinstance(models[0], AttnProcsLayers):
-            tmp_unet = UNet2DConditionModel.from_pretrained(
-                config.pretrained.model, revision=config.pretrained.revision, subfolder="unet"
-            )
-            tmp_unet.load_attn_procs(input_dir)
-            models[0].load_state_dict(AttnProcsLayers(tmp_unet.attn_processors).state_dict())
-            del tmp_unet
-        else:
-            raise ValueError(f"Unknown model type {type(models[0])}")
-        models.pop()  # ensures that accelerate doesn't try to handle loading of the model
-
-    accelerator.register_save_state_pre_hook(save_model_hook)
-    accelerator.register_load_state_pre_hook(load_model_hook)    
-
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
     if config.allow_tf32:
@@ -263,21 +253,11 @@ def main(_):
         eps=config.train.adam_epsilon,
     )
 
-    # ******** classifier ***********
-    cls_optimizer = optimizer_cls(
-        classifier.parameters(),
-        lr=config.train.cls_learning_rate,
-        betas=(config.train.adam_beta1, config.train.adam_beta2),
-        weight_decay=config.train.adam_weight_decay,
-        eps=config.train.adam_epsilon,
-    )
-
     prompt_fn = getattr(prompts_file, config.prompt_fn)
 
-    if config.eval_prompt_fn == '':
-        eval_prompt_fn = prompt_fn
-    else:
-        eval_prompt_fn = getattr(prompts_file, config.eval_prompt_fn)
+    eval_prompts,eval_labels = get_eval_prompts()
+    eval_labels = torch.tensor(eval_labels)
+    eval_labels = eval_labels.to(accelerator.device, dtype=torch.long)
 
     # generate negative prompt embeddings
     neg_prompt_embed = pipeline.text_encoder(
@@ -296,226 +276,226 @@ def main(_):
     
     # Prepare everything with our `accelerator`.
     unet, optimizer = accelerator.prepare(unet, optimizer)
-
-    #*********** classifier ************
-    classifier, cls_optimizer = accelerator.prepare(classifier, cls_optimizer)
-    transforms = torchvision.transforms.Compose([
-            v2.Resize((224,224)),
-            v2.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-        ]
-    )
     
-
-
-    loss_fn = torch.nn.CrossEntropyLoss(reduction='none')
-
-    keep_input = True
+    loss_fn,classifier,cls_optimizer = cls_loss_fn(accelerator,config)
+    
+    
     timesteps = pipeline.scheduler.timesteps
     
-    if config.resume_from:
-        logger.info(f"Resuming from {config.resume_from}")
-        accelerator.load_state(config.resume_from)
-        first_epoch = int(config.resume_from.split("_")[-1]) + 1
-    else:
-        first_epoch = 0 
-       
-    global_step = 0
-
     eval_dataset = ImageNette()
     eval_dataloader = torch.utils.data.DataLoader(eval_dataset,batch_size=config.train.batch_size_per_gpu)
 
-    if config.only_eval:
-        #################### EVALUATION ONLY ####################                
-        with torch.no_grad():
-            eval_loss,eval_acc = evaluate(classifier,eval_dataloader,accelerator)
-        print("Evaluation results", eval_acc)
+    
+    first_epoch = 0 
+    global_step = 0
+    
+    eval_dataset = ImageNette()
+    eval_dataloader = torch.utils.data.DataLoader(eval_dataset,batch_size=config.train.batch_size_per_gpu)
+
+    
+
+    with torch.no_grad():
+        # #eval_loss,eval_acc = evaluate(classifier,eval_dataloader,accelerator)
+        eval_loss, eval_acc = evaluate(classifier,eval_dataloader,accelerator)
+        accelerator.log({"eval_loss": eval_loss,"eval_acc":eval_acc},step=global_step)        
+        accelerator.log({"epoch": 0, "inner_epoch": 0,"eval_accuracy":eval_acc,"eval_loss":eval_loss}, step=0)
+        
+        all_eval_images = []
+        all_eval_rewards = []
+        generator = torch.cuda.manual_seed(config.seed)
+        latent = torch.randn((config.train.batch_size_per_gpu_available*config.max_vis_images, 4, 64, 64), device=accelerator.device, dtype=inference_dtype, generator=generator)
+        for index in range(config.max_vis_images):
+            ims, rewards = evaluate_diff(latent[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)],
+                                            train_neg_prompt_embeds, 
+                                            eval_prompts[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)], 
+                                            pipeline, accelerator, inference_dtype,config, loss_fn,eval_labels[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)])
+            all_eval_images.append(ims)
+            all_eval_rewards.append(rewards)
+        eval_rewards = torch.cat(all_eval_rewards)
+        eval_images = torch.cat(all_eval_images)
+        eval_image_vis = []
         if accelerator.is_main_process:
-            if config.run_name != "":
-                name_val = config.run_name
-            else:
-                name_val = wandb.run.name            
+            name_val = wandb.run.name
             log_dir = f"logs/{name_val}/eval_vis"
-            os.makedirs(log_dir, exist_ok=True)                    
-            accelerator.log({"eval_loss": eval_loss,"eval_acc":eval_acc},step=global_step)        
-    else:
+            os.makedirs(log_dir, exist_ok=True)
+            for i, eval_image in enumerate(eval_images):
+                eval_image = (eval_image.clone().detach() / 2 + 0.5).clamp(0, 1)
+                pil = Image.fromarray((eval_image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
+                prompt = eval_prompts[i]
+                pil.save(f"{log_dir}/0_{prompt}.png")
+                pil = pil.resize((256, 256))
+                reward = eval_rewards[i]
+                eval_image_vis.append(wandb.Image(pil, caption=f"{prompt:.25} | {reward:.2f}"))                    
+            accelerator.log({"eval_images": eval_image_vis},step=0)
+    
+    #################### TRAINING ####################        
+    for epoch in list(range(first_epoch, config.num_epochs)):
+        unet.train()
+        info = defaultdict(list)
+        info_vis = defaultdict(list)
+        image_vis_list = []
+        
+        for inner_iters in tqdm(list(range(config.train.data_loader_iterations)),position=0,disable=not accelerator.is_local_main_process):
+            latent = torch.randn((config.train.batch_size_per_gpu_available, 4, 64, 64), device=accelerator.device, dtype=inference_dtype)    
 
-        #################### TRAINING ####################        
-        for epoch in list(range(first_epoch, config.num_epochs)):
-            unet.train()
+            if accelerator.is_main_process:
+
+                logger.info(f"{wandb.run.name} Epoch {epoch}.{inner_iters}: training")
+
             
-            info = defaultdict(list)
-            info_vis = defaultdict(list)
-            image_vis_list = []
+            prompts, labels = zip(
+                *[prompt_fn() for _ in range(config.train.batch_size_per_gpu_available)]
+            )
+            labels = torch.tensor(labels)
+            labels = labels.to(accelerator.device, dtype=torch.long)
+
+            prompt_ids = pipeline.tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=pipeline.tokenizer.model_max_length,
+            ).input_ids.to(accelerator.device)   
+
+            pipeline.scheduler.alphas_cumprod = pipeline.scheduler.alphas_cumprod.to(accelerator.device)
+            prompt_embeds = pipeline.text_encoder(prompt_ids)[0]         
             
-            for inner_iters in tqdm(list(range(config.train.data_loader_iterations)),position=0,disable=not accelerator.is_local_main_process):
-                classifier.train()
-                latent = torch.randn((config.train.batch_size_per_gpu_available, 4, 64, 64), device=accelerator.device, dtype=inference_dtype)    
+        
+            with accelerator.accumulate(unet):
+                with autocast():
+                    with torch.enable_grad(): # important b/c don't have on by default in module                        
 
-                if accelerator.is_main_process:
-
-                    logger.info(f"{wandb.run.name} Epoch {epoch}.{inner_iters}: training")
-
-                
-                prompts, labels = zip(
-                    *[prompt_fn() for _ in range(config.train.batch_size_per_gpu_available)]
-                )
-                labels = torch.tensor(labels)
-                labels = labels.to(accelerator.device, dtype=torch.long)
-
-                prompt_ids = pipeline.tokenizer(
-                    prompts,
-                    return_tensors="pt",
-                    padding="max_length",
-                    truncation=True,
-                    max_length=pipeline.tokenizer.model_max_length,
-                ).input_ids.to(accelerator.device)   
-
-                pipeline.scheduler.alphas_cumprod = pipeline.scheduler.alphas_cumprod.to(accelerator.device)
-                prompt_embeds = pipeline.text_encoder(prompt_ids)[0]         
-                
-            
-                with accelerator.accumulate(unet):
-                    with accelerator.accumulate(classifier):
-                        with autocast():
-                            with torch.enable_grad(): # important b/c don't have on by default in module                        
-
-                                keep_input = True
-                                for i, t in tqdm(enumerate(timesteps), total=len(timesteps)):
-                                    t = torch.tensor([t],
-                                                        dtype=inference_dtype,
-                                                        device=latent.device)
-                                    t = t.repeat(config.train.batch_size_per_gpu_available)
-                                    
-                                    if config.grad_checkpoint:
-                                        noise_pred_uncond = checkpoint.checkpoint(unet, latent, t, train_neg_prompt_embeds, use_reentrant=False).sample
-                                        noise_pred_cond = checkpoint.checkpoint(unet, latent, t, prompt_embeds, use_reentrant=False).sample
-                                    else:
-                                        noise_pred_uncond = unet(latent, t, train_neg_prompt_embeds).sample
-                                        noise_pred_cond = unet(latent, t, prompt_embeds).sample
-                                                                    
-                                    if config.truncated_backprop:
-                                        if config.truncated_backprop_rand:
-                                            timestep = random.randint(config.truncated_backprop_minmax[0],config.truncated_backprop_minmax[1])
-                                            if i < timestep:
-                                                noise_pred_uncond = noise_pred_uncond.detach()
-                                                noise_pred_cond = noise_pred_cond.detach()
-                                        else:
-                                            if i < config.trunc_backprop_timestep:
-                                                noise_pred_uncond = noise_pred_uncond.detach()
-                                                noise_pred_cond = noise_pred_cond.detach()
-
-                                    grad = (noise_pred_cond - noise_pred_uncond)
-                                    noise_pred = noise_pred_uncond + config.sd_guidance_scale * grad                
-                                    latent = pipeline.scheduler.step(noise_pred, t[0].long(), latent).prev_sample
-                                                        
-                                ims = pipeline.vae.decode(latent.to(pipeline.vae.dtype) / 0.18215).sample
-                                
-                                # ********classifier**************
-                                # ** Normalize???
-                                # ims = torch.clamp(ims, 0, 1)
-                                viz_ims = ims.clone().detach()
-
-                                ims = (ims/ 2 + 0.5).clamp(0, 1)
-                                ims = transforms(ims)
-                                logits = classifier(ims)
-
-                                loss = loss_fn(logits,labels)
-                                
-                                loss =  loss.sum()
-                                loss = loss/config.train.batch_size_per_gpu_available
-                                loss = loss * config.train.loss_coeff
-
-                                accuracy = (torch.argmax(logits,dim=1) == labels).float()
-                                
-                                if len(info_vis["image"]) < config.max_vis_images:
-                                    info_vis["image"].append(viz_ims)
-                                    info_vis["prompts"] = list(info_vis["prompts"]) + list(prompts)
-                                    info_vis["acc"].append(accuracy.clone().detach())
-                                
-                                info["loss"].append(loss)
-                                info["accuracy"].append(accuracy.mean())
-                                
-                                # backward pass
-                                accelerator.backward(loss)
-
-                                #*******negate the parametrs**********
-                                [p.grad.data.neg_() for p in unet.parameters()]
-                                if accelerator.sync_gradients:
-                                    accelerator.clip_grad_norm_(unet.parameters(), config.train.max_grad_norm)
-                                optimizer.step()
-                                optimizer.zero_grad() 
-
-                                #*******classifier**********
-                                cls_optimizer.step()
-                                cls_optimizer.zero_grad()
-                     
-
-                # Checks if the accelerator has performed an optimization step behind the scenes
-                if accelerator.sync_gradients:
-                    assert (
-                        inner_iters + 1
-                    ) % config.train.gradient_accumulation_steps == 0
-                    # log training and evaluation 
-                    if config.visualize_eval and (global_step % config.vis_freq ==0):
-
-                        with torch.no_grad():
-                            classifier.eval()
-                            eval_loss,eval_acc = evaluate(classifier,eval_dataloader,accelerator)
-                            # info["eval_loss"].append(eval_loss)
-                            # info["eval_accuracy"].append(eval_acc)
+                        keep_input = True
+                        for i, t in tqdm(enumerate(timesteps), total=len(timesteps)):
+                            t = torch.tensor([t],
+                                                dtype=inference_dtype,
+                                                device=latent.device)
+                            t = t.repeat(config.train.batch_size_per_gpu_available)
                             
-
-                            if accelerator.is_main_process:
-                                if config.run_name != "":
-                                    name_val = config.run_name
+                            if config.grad_checkpoint:
+                                noise_pred_uncond = checkpoint.checkpoint(unet, latent, t, train_neg_prompt_embeds, use_reentrant=False).sample
+                                noise_pred_cond = checkpoint.checkpoint(unet, latent, t, prompt_embeds, use_reentrant=False).sample
+                            else:
+                                noise_pred_uncond = unet(latent, t, train_neg_prompt_embeds).sample
+                                noise_pred_cond = unet(latent, t, prompt_embeds).sample
+                                                            
+                            if config.truncated_backprop:
+                                if config.truncated_backprop_rand:
+                                    timestep = random.randint(config.truncated_backprop_minmax[0],config.truncated_backprop_minmax[1])
+                                    if i < timestep:
+                                        noise_pred_uncond = noise_pred_uncond.detach()
+                                        noise_pred_cond = noise_pred_cond.detach()
                                 else:
-                                    name_val = wandb.run.name            
-                                log_dir = f"logs/{name_val}/eval_vis"
-                                os.makedirs(log_dir, exist_ok=True)                    
-                                accelerator.log({"eval_loss": eval_loss,"eval_acc":eval_acc},step=global_step)
-                    
-                    logger.info("Logging")
-                    
-                    info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
-                    info = accelerator.reduce(info, reduction="mean")
-                    logger.info(f"loss: {info['loss']}, accuracy: {info['accuracy']}")
-                    #logger.info(f"eval_loss: {info['eval_loss']}, eval_acc: {info['eval_accuracy']}")
+                                    if i < config.trunc_backprop_timestep:
+                                        noise_pred_uncond = noise_pred_uncond.detach()
+                                        noise_pred_cond = noise_pred_cond.detach()
 
-
-                    info.update({"epoch": epoch, "inner_epoch": inner_iters,"eval_accuracy":eval_acc,"eval_loss":eval_loss})
-                    accelerator.log(info, step=global_step)
-
-                    if config.visualize_train:
-                        ims = torch.cat(info_vis["image"])
-                        acc = torch.cat(info_vis["acc"])
-                        prompts = info_vis["prompts"]
-                        images  = []
-                        for i, image in enumerate(ims):
-                            image = (image.clone().detach() / 2 + 0.5).clamp(0, 1)
-                            pil = Image.fromarray((image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
-                            pil = pil.resize((256, 256))
-                            prompt = prompts[i]
-                            ac = acc[i]
-                            images.append(wandb.Image(pil, caption=f"{prompt:.25} | {ac:.2f}"))
+                            grad = (noise_pred_cond - noise_pred_uncond)
+                            noise_pred = noise_pred_uncond + config.sd_guidance_scale * grad                
+                            latent = pipeline.scheduler.step(noise_pred, t[0].long(), latent).prev_sample
+                                                
+                        ims = pipeline.vae.decode(latent.to(pipeline.vae.dtype) / 0.18215).sample
                         
-                        accelerator.log(
-                            {"images": images},
-                            step=global_step,
-                        )
+                        
+                        loss, accuracy = loss_fn(ims, labels)
+                        
+                        loss =  loss.sum()
+                        loss = loss/config.train.batch_size_per_gpu_available
+                        loss = loss * config.train.loss_coeff
+                                                
+                        if len(info_vis["image"]) < config.max_vis_images:
+                            info_vis["image"].append(ims.clone().detach())
+                            info_vis["accuracy"].append(accuracy)
+                            info_vis["prompts"] = list(info_vis["prompts"]) + list(prompts)
+                        
+                        info["loss"].append(loss)
+                        info["accuracy"].append(accuracy.mean())
+                        
+                        # backward pass
+                        accelerator.backward(loss)
 
-                    global_step += 1
-                    info = defaultdict(list)
+                        [p.grad.data.neg_() for p in unet.parameters()]
+
+                        if accelerator.sync_gradients:
+                            accelerator.clip_grad_norm_(unet.parameters(), config.train.max_grad_norm)
+                        
+                        optimizer.step()
+                        optimizer.zero_grad()
+
+                        cls_optimizer.step()   
+                
+
+            # Checks if the accelerator has performed an optimization step behind the scenes
+            if accelerator.sync_gradients:
+                cls_optimizer.zero_grad()
+                assert (
+                    inner_iters + 1
+                ) % config.train.gradient_accumulation_steps == 0
+            #    log training and evaluation
+                all_eval_images = []
+                all_eval_rewards = []
+                if config.visualize_eval and (global_step % config.vis_freq ==0):
+                    with torch.no_grad():
+                        # #eval_loss,eval_acc = evaluate(classifier,eval_dataloader,accelerator)
+                        eval_loss, eval_acc = evaluate(classifier,eval_dataloader,accelerator)
+                        generator = torch.cuda.manual_seed(config.seed)
+                        latent = torch.randn((config.train.batch_size_per_gpu_available*config.max_vis_images, 4, 64, 64), device=accelerator.device, dtype=inference_dtype, generator=generator)
+                        for index in range(config.max_vis_images):
+                            ims, rewards = evaluate_diff(latent[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)],
+                                                            train_neg_prompt_embeds, 
+                                                            eval_prompts[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)], 
+                                                            pipeline, accelerator, inference_dtype,config, loss_fn,eval_labels[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)])
+                            all_eval_images.append(ims)
+                            all_eval_rewards.append(rewards)
+                        eval_rewards = torch.cat(all_eval_rewards)
+                        eval_images = torch.cat(all_eval_images)
+                        eval_image_vis = []
+                        if accelerator.is_main_process:
+                            name_val = wandb.run.name
+                            log_dir = f"logs/{name_val}/eval_vis"
+                            os.makedirs(log_dir, exist_ok=True)
+                            for i, eval_image in enumerate(eval_images):
+                                eval_image = (eval_image.clone().detach() / 2 + 0.5).clamp(0, 1)
+                                pil = Image.fromarray((eval_image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
+                                prompt = eval_prompts[i]
+                                pil.save(f"{log_dir}/{epoch:03d}_{inner_iters:03d}_{i:03d}_{prompt}.png")
+                                pil = pil.resize((256, 256))
+                                reward = eval_rewards[i]
+                                eval_image_vis.append(wandb.Image(pil, caption=f"{prompt:.25} | {reward:.2f}"))                    
+                            accelerator.log({"eval_images": eval_image_vis},step=global_step+1)
+                
+                logger.info("Logging")
+                
+                info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
+                info = accelerator.reduce(info, reduction="mean")
+                logger.info(f"loss: {info['loss']}, accuracy: {info['accuracy']}")
+
+                info.update({"epoch": epoch, "inner_epoch": inner_iters,"eval_accuracy":eval_acc,"eval_loss":eval_loss})
+                accelerator.log(info, step=global_step+1)
+
+                if config.visualize_train:
+                    ims = torch.cat(info_vis["image"])
+                    rewards = torch.cat(info_vis["accuracy"])
+                    prompts = info_vis["prompts"]
+                    images  = []
+                    for i, image in enumerate(ims):
+                        image = (image.clone().detach() / 2 + 0.5).clamp(0, 1)
+                        pil = Image.fromarray((image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
+                        pil = pil.resize((256, 256))
+                        prompt = prompts[i]
+                        reward = rewards[i]
+                        images.append(wandb.Image(pil, caption=f"{prompt:.25} | {reward:.2f}"))
+                    
+                    accelerator.log(
+                        {"images": images},
+                        step=global_step,
+                    )
+
+                global_step += 1
+                info = defaultdict(list)
 
             # make sure we did an optimization step at the end of the inner epoch
-            assert accelerator.sync_gradients
-            
-            if epoch % config.save_freq == 0 and accelerator.is_main_process:
-                accelerator.save_state()
-                output_splits = output_dir.split("/")
-                output_splits[1] = wandb.run.name
-                output_dir = "/".join(output_splits)
-                accelerator.save_model(classifier, output_dir)
-
+        assert accelerator.sync_gradients
 
 if __name__ == "__main__":
     app.run(main)

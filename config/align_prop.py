@@ -12,8 +12,8 @@ def general():
     config.save_freq = 4
     config.resume_from = ""
     config.resume_from_2 = ""
-    config.vis_freq = 2
-    config.max_vis_images = 2
+    config.vis_freq = 1
+    config.max_vis_images = 8
     config.only_eval = False
     config.run_name = ""
     
@@ -114,7 +114,7 @@ def classifier():
     config.num_epochs = 200
 
     config.train.max_grad_norm = 5.0    
-    config.train.loss_coeff = 0.01
+    config.train.loss_coeff = 1
     config.train.learning_rate = 1e-3
     config.max_vis_images = 4
     config.train.adam_weight_decay = 0.1
@@ -126,7 +126,7 @@ def classifier():
     config.truncated_backprop_minmax = (0,50)
     config.trunc_backprop_timestep = 40
     config.truncated_backprop = True
-    config = set_config_batch(config,total_samples_per_epoch=256,total_batch_size= 4, per_gpu_capacity=2)
+    config = set_config_batch(config,total_samples_per_epoch=256,total_batch_size= 32, per_gpu_capacity=2)
     return config
 
 def aesthetic():
@@ -140,7 +140,7 @@ def aesthetic():
     config.train.max_grad_norm = 5.0    
     config.train.loss_coeff = 0.01
     config.train.learning_rate = 1e-3
-    config.max_vis_images = 4
+    config.max_vis_images = 8
     config.train.adam_weight_decay = 0.1
     
     config.save_freq = 1
@@ -150,7 +150,7 @@ def aesthetic():
     config.truncated_backprop_minmax = (0,50)
     config.trunc_backprop_timestep = 40
     config.truncated_backprop = True
-    config = set_config_batch(config,total_samples_per_epoch=256,total_batch_size= 128, per_gpu_capacity=4)
+    config = set_config_batch(config,total_samples_per_epoch=256,total_batch_size= 4, per_gpu_capacity=2)
     return config
 
 def aesthetic_k1():
