@@ -118,7 +118,6 @@ def classifier():
     config.train.learning_rate = 1e-3
     config.max_vis_images = 4
     config.train.adam_weight_decay = 0.1
-    
     config.save_freq = 1
     config.num_epochs = 10
     config.num_checkpoint_limit = 14
@@ -126,7 +125,9 @@ def classifier():
     config.truncated_backprop_minmax = (0,50)
     config.trunc_backprop_timestep = 40
     config.truncated_backprop = True
-    config = set_config_batch(config,total_samples_per_epoch=256,total_batch_size= 32, per_gpu_capacity=2)
+    config = set_config_batch(config,total_samples_per_epoch=256,total_batch_size= 64, per_gpu_capacity=4)
+
+    config.eval_freq = 4 * config.train.gradient_accumulation_steps
     return config
 
 def aesthetic():

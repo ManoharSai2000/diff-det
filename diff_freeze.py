@@ -36,11 +36,20 @@ from dataset import ImageNette
 from prompts import get_eval_prompts
 from lora import LORALayer
 
-wandb.login(key="79f62e3ced6e29113704104163b3ee93b4004c35")
-wandb_name = "imagenet_full_resnet101_lora_r32"
-dataset_name = "imagenet"
-def cls_loss_fn(accelerator,config):
+from peft import LoraModel, LoraConfig
+lora_config = LoraConfig(
+    task_type="SEQ_2_SEQ_LM",
+    r=8,
+    lora_alpha=16,
+    target_modules=["q", "v"],
+    lora_dropout=0.01,
+)
 
+os.environ["WANDB_API_KEY"] = "79f62e3ced6e29113704104163b3ee93b4004c35"
+wandb_name = "diff_f_imagenet_full_resnet101_lora_r32"
+dataset_name = "imagenet"
+
+def cls_loss_fn(accelerator,config):
     
     normalize = torchvision.transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
                                                 std=[0.26862954, 0.26130258, 0.27577711])
@@ -220,32 +229,7 @@ def main(_):
 
     pipeline.unet.to(accelerator.device, dtype=inference_dtype)    
     # Set correct lora layers
-    lora_attn_procs = {}
-    for name in pipeline.unet.attn_processors.keys():
-        cross_attention_dim = (
-            None if name.endswith("attn1.processor") else pipeline.unet.config.cross_attention_dim
-        )
-        if name.startswith("mid_block"):
-            hidden_size = pipeline.unet.config.block_out_channels[-1]
-        elif name.startswith("up_blocks"):
-            block_id = int(name[len("up_blocks.")])
-            hidden_size = list(reversed(pipeline.unet.config.block_out_channels))[block_id]
-        elif name.startswith("down_blocks"):
-            block_id = int(name[len("down_blocks.")])
-            hidden_size = pipeline.unet.config.block_out_channels[block_id]
-
-        lora_attn_procs[name] = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
-    pipeline.unet.set_attn_processor(lora_attn_procs)
-
-    # this is a hack to synchronize gradients properly. the module that registers the parameters we care about (in
-    # this case, AttnProcsLayers) needs to also be used for the forward pass. AttnProcsLayers doesn't have a
-    # `forward` method, so we wrap it to add one and capture the rest of the unet parameters using a closure.
-    class _Wrapper(AttnProcsLayers):
-        def forward(self, *args, **kwargs):
-            return pipeline.unet(*args, **kwargs)
-
-    unet = _Wrapper(pipeline.unet.attn_processors)        
-
+    unet = pipeline.unet
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
     if config.allow_tf32:
@@ -253,14 +237,6 @@ def main(_):
     
     # Initialize the optimizer
     optimizer_cls = torch.optim.AdamW
-
-    optimizer = optimizer_cls(
-        unet.parameters(),
-        lr=config.train.learning_rate,
-        betas=(config.train.adam_beta1, config.train.adam_beta2),
-        weight_decay=config.train.adam_weight_decay,
-        eps=config.train.adam_epsilon,
-    )
 
     prompt_fn = getattr(prompts_file, config.prompt_fn)
 
@@ -284,20 +260,19 @@ def main(_):
     autocast = contextlib.nullcontext
     
     # Prepare everything with our `accelerator`.
-    unet, optimizer = accelerator.prepare(unet, optimizer)
+    unet = accelerator.prepare(unet)
     
     loss_fn,classifier,cls_optimizer = cls_loss_fn(accelerator,config)
     
     
     timesteps = pipeline.scheduler.timesteps
     
-    eval_dataset = ImageNette(dataset_name)
+    eval_dataset = ImageNette(dataset_name=dataset_name)
     eval_dataloader = torch.utils.data.DataLoader(eval_dataset,batch_size=config.train.batch_size_per_gpu)
 
     
     first_epoch = 0 
     global_step = 0
-    
 
     with torch.no_grad():
         # #eval_loss,eval_acc = evaluate(classifier,eval_dataloader,accelerator)
@@ -363,45 +338,44 @@ def main(_):
             ).input_ids.to(accelerator.device)   
 
             pipeline.scheduler.alphas_cumprod = pipeline.scheduler.alphas_cumprod.to(accelerator.device)
-            prompt_embeds = pipeline.text_encoder(prompt_ids)[0]         
-            
+            prompt_embeds = pipeline.text_encoder(prompt_ids)[0]  
+            with torch.no_grad():
+                keep_input = True
+                for i, t in tqdm(enumerate(timesteps), total=len(timesteps)):
+                    t = torch.tensor([t],
+                                        dtype=inference_dtype,
+                                        device=latent.device)
+                    t = t.repeat(config.train.batch_size_per_gpu_available)
+                    
+                    if config.grad_checkpoint:
+                        noise_pred_uncond = checkpoint.checkpoint(unet, latent, t, train_neg_prompt_embeds, use_reentrant=False).sample
+                        noise_pred_cond = checkpoint.checkpoint(unet, latent, t, prompt_embeds, use_reentrant=False).sample
+                    else:
+                        noise_pred_uncond = unet(latent, t, train_neg_prompt_embeds).sample
+                        noise_pred_cond = unet(latent, t, prompt_embeds).sample
+                                                    
+                    if config.truncated_backprop:
+                        if config.truncated_backprop_rand:
+                            timestep = random.randint(config.truncated_backprop_minmax[0],config.truncated_backprop_minmax[1])
+                            if i < timestep:
+                                noise_pred_uncond = noise_pred_uncond.detach()
+                                noise_pred_cond = noise_pred_cond.detach()
+                        else:
+                            if i < config.trunc_backprop_timestep:
+                                noise_pred_uncond = noise_pred_uncond.detach()
+                                noise_pred_cond = noise_pred_cond.detach()
+
+                    grad = (noise_pred_cond - noise_pred_uncond)
+                    noise_pred = noise_pred_uncond + config.sd_guidance_scale * grad                
+                    latent = pipeline.scheduler.step(noise_pred, t[0].long(), latent).prev_sample
+                                        
+                ims = pipeline.vae.decode(latent.to(pipeline.vae.dtype) / 0.18215).sample       
+    
         
-            with accelerator.accumulate(unet):
+            with accelerator.accumulate(classifier):
                 with autocast():
                     with torch.enable_grad(): # important b/c don't have on by default in module                        
-
-                        keep_input = True
-                        for i, t in tqdm(enumerate(timesteps), total=len(timesteps)):
-                            t = torch.tensor([t],
-                                                dtype=inference_dtype,
-                                                device=latent.device)
-                            t = t.repeat(config.train.batch_size_per_gpu_available)
-                            
-                            if config.grad_checkpoint:
-                                noise_pred_uncond = checkpoint.checkpoint(unet, latent, t, train_neg_prompt_embeds, use_reentrant=False).sample
-                                noise_pred_cond = checkpoint.checkpoint(unet, latent, t, prompt_embeds, use_reentrant=False).sample
-                            else:
-                                noise_pred_uncond = unet(latent, t, train_neg_prompt_embeds).sample
-                                noise_pred_cond = unet(latent, t, prompt_embeds).sample
-                                                            
-                            if config.truncated_backprop:
-                                if config.truncated_backprop_rand:
-                                    timestep = random.randint(config.truncated_backprop_minmax[0],config.truncated_backprop_minmax[1])
-                                    if i < timestep:
-                                        noise_pred_uncond = noise_pred_uncond.detach()
-                                        noise_pred_cond = noise_pred_cond.detach()
-                                else:
-                                    if i < config.trunc_backprop_timestep:
-                                        noise_pred_uncond = noise_pred_uncond.detach()
-                                        noise_pred_cond = noise_pred_cond.detach()
-
-                            grad = (noise_pred_cond - noise_pred_uncond)
-                            noise_pred = noise_pred_uncond + config.sd_guidance_scale * grad                
-                            latent = pipeline.scheduler.step(noise_pred, t[0].long(), latent).prev_sample
-                                                
-                        ims = pipeline.vae.decode(latent.to(pipeline.vae.dtype) / 0.18215).sample
-                        
-                        
+    
                         loss, accuracy = loss_fn(ims, labels)
                         
                         loss =  loss.sum()
@@ -419,20 +393,13 @@ def main(_):
                         # backward pass
                         accelerator.backward(loss)
 
-                        [p.grad.data.neg_() for p in unet.parameters()]
-
-                        if accelerator.sync_gradients:
-                            accelerator.clip_grad_norm_(unet.parameters(), config.train.max_grad_norm)
-                        
-                        optimizer.step()
-                        optimizer.zero_grad()
-
-                        cls_optimizer.step()   
+                        cls_optimizer.step() 
+                        cls_optimizer.zero_grad()
+    
                 
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
-                cls_optimizer.zero_grad()
                 assert (
                     inner_iters + 1
                 ) % config.train.gradient_accumulation_steps == 0
@@ -441,6 +408,7 @@ def main(_):
                 all_eval_rewards = []
                 if config.visualize_eval and (global_step % config.vis_freq ==0):
                     with torch.no_grad():
+                        # #eval_loss,eval_acc = evaluate(classifier,eval_dataloader,accelerator)
                         eval_loss, eval_acc = evaluate(classifier,eval_dataloader,accelerator)
                         generator = torch.cuda.manual_seed(config.seed)
                         latent = torch.randn((config.train.batch_size_per_gpu_available*config.max_vis_images, 4, 64, 64), device=accelerator.device, dtype=inference_dtype, generator=generator)
@@ -473,6 +441,7 @@ def main(_):
                 info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
                 info = accelerator.reduce(info, reduction="mean")
                 logger.info(f"loss: {info['loss']}, accuracy: {info['accuracy']}")
+
                 info.update({"epoch": epoch, "inner_epoch": inner_iters,"eval_accuracy":eval_acc,"eval_loss":eval_loss})
                 accelerator.log(info, step=global_step+1)
 

@@ -8,8 +8,8 @@ from PIL import Image
 import json
 
 class ImageNette(Dataset):
-    def __init__(self, base_dir=None):
-        self.base_dir =  "/home/malapati/Storage/diffusion-detection/AlignProp/data/imagenette2/val"
+    def __init__(self, dataset_name = "imagenette2", base_dir=None):
+        self.base_dir =  f"/home/mprabhud/phd_projects/diff-det/diff-det/data/{dataset_name}/val"
         self.classes = os.listdir(self.base_dir)
         self.image_paths,self.labels = [], []
         self.process_label_map()
@@ -25,12 +25,13 @@ class ImageNette(Dataset):
             ]
         )
     
-    def process_label_map(self,path="/home/malapati/Storage/diffusion-detection/AlignProp/data/imagenette2/imagenet_class_index.json"):
+    def process_label_map(self,path="/home/mprabhud/phd_projects/diff-det/diff-det/data/imagenet_class_index.json"):
         self.class_idx = json.load(open(path,'r'))
         self.idx2label = {}
+        self.label2name = {}
         for k in range(len(self.class_idx)):
             self.idx2label[self.class_idx[str(k)][0]] = k
-        
+            self.label2name[k] = self.class_idx[str(k)][1]
 
     def __len__(self):
         return len(self.labels)

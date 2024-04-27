@@ -10,32 +10,50 @@ dataset = ImageNette()
 IE = inflect.engine()
 ASSETS_PATH = resources.files("assets")
 
-classes = {"tench" : "n01440764", 
-           "English springer" : "n02102040",
-           "cassette player" : "n02979186", 
-           "chain saw" : "n03000684", 
-           "church" : "n03028079", 
-           "French horn" : "n03394916", 
-           "garbage truck" : "n03417042", 
-           "gas pump" : "n03425413", 
-           "golf ball" : "n03445777", 
-           "parachute" : "n03888257"
-}
-class_names = list(classes.keys()) 
+classes = {
+            "imagenette2" : [
+                "n01440764", 
+                "n02102040",
+                "n02979186", 
+                "n03000684", 
+                "n03028079", 
+                "n03394916", 
+                "n03417042", 
+                "n03425413", 
+                "n03445777", 
+                "n03888257"
+            ],
+        "imagewoof2" : [
+            "n02096294" ,
+            "n02093754",
+            "n02111889",
+            "n02088364" , 
+            "n02086240" , 
+            "n02089973",
+            "n02087394", 
+            "n02115641", 
+            "n02099601" , 
+            "n02105641"
+        ],
+        "imagenet" : list(dataset.idx2label.keys())
+} 
 
-def get_prompt(cls):
-    return f"an image of {cls}"
+def get_prompt(class_name):
+    return f"an image of {class_name}"
 
-def get_eval_prompts():
+def get_eval_prompts(dataset_name):
     eval_prompts, eval_labels = [], [] 
-    for cls in range(len(classes)):
-        eval_prompts.append(get_prompt(class_names[cls])), eval_labels.append(dataset.idx2label[classes[class_names[cls]]])
+    class_idx = classes[dataset_name]
+    for cls_idx in class_idx:
+        eval_prompts.append(get_prompt(dataset.label2name[dataset.idx2label[cls_idx]])) 
+        eval_labels.append(dataset.idx2label[cls_idx])
     return eval_prompts,eval_labels
 
 
-def class_prompts():
-    cls = random.choice(list(range(len(class_names))))
-    return get_prompt(class_names[cls]), dataset.idx2label[classes[class_names[cls]]]
+def class_prompts(dataset_name):
+    class_idx = classes[dataset_name]
+    label = random.choice(list(range(len(class_idx))))
+    return get_prompt(dataset.label2name[label]), label
 
 @functools.cache
 def _load_lines(path):
